@@ -1,0 +1,20 @@
+[Unit]
+Description=Homelab cluster agent (startup/shutdown webhook)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/homelab-cluster-agent.env
+ExecStart=/usr/local/bin/homelab-cluster-agent
+Restart=on-failure
+RestartSec=5
+
+# Hardening — no network overhead beyond the process itself, no container runtime.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
