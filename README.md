@@ -5,6 +5,11 @@ Small always-on HTTP service that runs the homelab's cluster `startup.sh` /
 from Home Assistant) from a host that stays up when the k3s cluster itself
 is powered down.
 
+If `WOL_MAC` is set, `POST /hooks/startup` first sends a Wake-on-LAN magic
+packet to that address (e.g. the Proxmox host's MAC — the k3s nodes are VMs
+on it with `on_boot = true`, so waking the hypervisor brings them all back)
+before running `STARTUP_SCRIPT`. WOL is a no-op if `WOL_MAC` is unset.
+
 ## Endpoints
 
 All endpoints except `/healthz` require the shared-secret header
@@ -24,12 +29,21 @@ stdout/stderr.
 
 ## Configuration (environment variables)
 
-| Variable          | Default                            | Required |
-| ----------------- | ---------------------------------- | -------- |
-| `AGENT_TOKEN`     | —                                  | yes      |
-| `LISTEN_ADDR`     | `:9090`                            | no       |
-| `STARTUP_SCRIPT`  | `/opt/homelab/scripts/startup.sh`  | no       |
-| `SHUTDOWN_SCRIPT` | `/opt/homelab/scripts/shutdown.sh` | no       |
+| Variable             | Default                            | Required |
+| -------------------- | ----------------------------------- | -------- |
+| `AGENT_TOKEN`        | —                                  | yes      |
+| `LISTEN_ADDR`        | `:9090`                            | no       |
+| `STARTUP_SCRIPT`     | `/opt/homelab/scripts/startup.sh`  | no       |
+| `SHUTDOWN_SCRIPT`    | `/opt/homelab/scripts/shutdown.sh` | no       |
+| `WOL_MAC`            | —                                  | no       |
+| `WOL_BROADCAST_ADDR` | `255.255.255.255:9`                | no       |
+
+`WOL_MAC` is the target's MAC address (e.g. `aa:bb:cc:dd:ee:ff`). Leave it
+unset to disable WOL. `WOL_BROADCAST_ADDR` is the `host:port` the magic
+packet is sent to — usually the LAN broadcast address on port 7 or 9; if the
+agent isn't on the same L2 segment as the target, point it at that subnet's
+directed broadcast address instead (e.g. `10.0.10.255:9`) and make sure your
+router/switch permits it.
 
 ## Build
 

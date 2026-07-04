@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -84,6 +85,8 @@ type config struct {
 	token          string
 	startupScript  string
 	shutdownScript string
+	wolMAC         string
+	wolBroadcast   string
 }
 
 func loadConfig() config {
@@ -92,11 +95,70 @@ func loadConfig() config {
 		token:          os.Getenv("AGENT_TOKEN"),
 		startupScript:  getenv("STARTUP_SCRIPT", "/opt/homelab/scripts/startup.sh"),
 		shutdownScript: getenv("SHUTDOWN_SCRIPT", "/opt/homelab/scripts/shutdown.sh"),
+		wolMAC:         getenv("WOL_MAC", ""),
+		wolBroadcast:   getenv("WOL_BROADCAST_ADDR", "255.255.255.255:9"),
 	}
 	if cfg.token == "" {
 		log.Fatal("AGENT_TOKEN must be set")
 	}
+	if cfg.wolMAC != "" {
+		if _, err := net.ParseMAC(cfg.wolMAC); err != nil {
+			log.Fatalf("invalid WOL_MAC %q: %v", cfg.wolMAC, err)
+		}
+	}
 	return cfg
+}
+
+// magicPacket builds the standard 102-byte Wake-on-LAN payload for mac:
+// six 0xFF bytes followed by the target MAC address repeated 16 times.
+func magicPacket(mac string) ([]byte, error) {
+	hwAddr, err := net.ParseMAC(mac)
+	if err != nil {
+		return nil, fmt.Errorf("parse mac: %w", err)
+	}
+	if len(hwAddr) != 6 {
+		return nil, fmt.Errorf("mac %q must be 6 bytes, got %d", mac, len(hwAddr))
+	}
+	packet := make([]byte, 0, 102)
+	for i := 0; i < 6; i++ {
+		packet = append(packet, 0xFF)
+	}
+	for i := 0; i < 16; i++ {
+		packet = append(packet, hwAddr...)
+	}
+	return packet, nil
+}
+
+// sendMagicPacket wakes a host by UDP-broadcasting a magic packet for mac to
+// broadcastAddr (host:port, typically the subnet broadcast address on port 9).
+func sendMagicPacket(mac, broadcastAddr string) error {
+	packet, err := magicPacket(mac)
+	if err != nil {
+		return err
+	}
+	conn, err := net.Dial("udp", broadcastAddr)
+	if err != nil {
+		return fmt.Errorf("dial %s: %w", broadcastAddr, err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write(packet); err != nil {
+		return fmt.Errorf("write to %s: %w", broadcastAddr, err)
+	}
+	return nil
+}
+
+// wolPreRun returns a runJob pre-step that sends a WOL magic packet, or nil
+// if no target MAC is configured (WOL stays a no-op by default).
+func wolPreRun(cfg config) func() (string, error) {
+	if cfg.wolMAC == "" {
+		return nil
+	}
+	return func() (string, error) {
+		if err := sendMagicPacket(cfg.wolMAC, cfg.wolBroadcast); err != nil {
+			return "", fmt.Errorf("WOL: failed to send magic packet to %s: %w", cfg.wolMAC, err)
+		}
+		return fmt.Sprintf("WOL: sent magic packet to %s via %s", cfg.wolMAC, cfg.wolBroadcast), nil
+	}
 }
 
 func getenv(key, fallback string) string {
@@ -122,8 +184,8 @@ func main() {
 		}
 		writeJSON(w, state.snapshot())
 	})
-	mux.HandleFunc("POST /hooks/startup", jobHandler(state, "startup", cfg.startupScript, cfg.token))
-	mux.HandleFunc("POST /hooks/shutdown", jobHandler(state, "shutdown", cfg.shutdownScript, cfg.token))
+	mux.HandleFunc("POST /hooks/startup", jobHandler(state, "startup", cfg.startupScript, cfg.token, wolPreRun(cfg)))
+	mux.HandleFunc("POST /hooks/shutdown", jobHandler(state, "shutdown", cfg.shutdownScript, cfg.token, nil))
 
 	log.Printf("homelab-cluster-agent listening on %s", cfg.addr)
 	if err := http.ListenAndServe(cfg.addr, mux); err != nil {
@@ -136,7 +198,7 @@ func authorized(r *http.Request, token string) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
 }
 
-func jobHandler(state *jobState, name, scriptPath, token string) http.HandlerFunc {
+func jobHandler(state *jobState, name, scriptPath, token string, preRun func() (string, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !authorized(r, token) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -151,15 +213,27 @@ func jobHandler(state *jobState, name, scriptPath, token string) http.HandlerFun
 			return
 		}
 		log.Printf("starting job %q (%s)", name, scriptPath)
-		go runJob(state, name, scriptPath)
+		go runJob(state, name, scriptPath, preRun)
 		w.WriteHeader(http.StatusAccepted)
 		writeJSON(w, map[string]any{"status": "started", "job": name})
 	}
 }
 
-func runJob(state *jobState, name, scriptPath string) {
-	cmd := exec.Command(scriptPath)
+func runJob(state *jobState, name, scriptPath string, preRun func() (string, error)) {
 	var out bytes.Buffer
+	if preRun != nil {
+		msg, err := preRun()
+		if msg != "" {
+			log.Print(msg)
+			out.WriteString(msg + "\n")
+		}
+		if err != nil {
+			log.Printf("job %q pre-run step failed: %v", name, err)
+			out.WriteString(err.Error() + "\n")
+		}
+	}
+
+	cmd := exec.Command(scriptPath)
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	err := cmd.Run()
