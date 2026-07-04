@@ -2,12 +2,10 @@ package main
 
 import (
 	"encoding/json"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -37,8 +35,8 @@ func newTestMux(startupScript, shutdownScript string) (http.Handler, *jobState) 
 		}
 		writeJSON(w, state.snapshot())
 	})
-	mux.HandleFunc("POST /hooks/startup", jobHandler(state, "startup", startupScript, testToken, nil))
-	mux.HandleFunc("POST /hooks/shutdown", jobHandler(state, "shutdown", shutdownScript, testToken, nil))
+	mux.HandleFunc("POST /hooks/startup", jobHandler(state, "startup", startupScript, testToken))
+	mux.HandleFunc("POST /hooks/shutdown", jobHandler(state, "shutdown", shutdownScript, testToken))
 	return mux, state
 }
 
@@ -187,105 +185,5 @@ func TestStatusRequiresToken(t *testing.T) {
 	rec := doRequest(t, mux, http.MethodGet, "/status", "")
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rec.Code)
-	}
-}
-
-func TestMagicPacketFormat(t *testing.T) {
-	packet, err := magicPacket("AA:BB:CC:DD:EE:FF")
-	if err != nil {
-		t.Fatalf("magicPacket: %v", err)
-	}
-	if len(packet) != 102 {
-		t.Fatalf("len(packet) = %d, want 102", len(packet))
-	}
-	for i := 0; i < 6; i++ {
-		if packet[i] != 0xFF {
-			t.Fatalf("packet[%d] = %#x, want 0xFF", i, packet[i])
-		}
-	}
-	want := []byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}
-	for rep := 0; rep < 16; rep++ {
-		got := packet[6+rep*6 : 6+rep*6+6]
-		for i, b := range got {
-			if b != want[i] {
-				t.Fatalf("mac repetition %d = % x, want % x", rep, got, want)
-			}
-		}
-	}
-}
-
-func TestMagicPacketInvalidMAC(t *testing.T) {
-	if _, err := magicPacket("not-a-mac"); err == nil {
-		t.Fatal("expected error for invalid MAC, got nil")
-	}
-}
-
-func TestWolPreRunNilWhenUnconfigured(t *testing.T) {
-	cfg := config{wolMAC: ""}
-	if preRun := wolPreRun(cfg); preRun != nil {
-		t.Fatal("expected wolPreRun to be nil when WOL_MAC is unset")
-	}
-}
-
-func TestWolPreRunSendsPacket(t *testing.T) {
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer pc.Close()
-
-	cfg := config{wolMAC: "AA:BB:CC:DD:EE:FF", wolBroadcast: pc.LocalAddr().String()}
-	preRun := wolPreRun(cfg)
-	if preRun == nil {
-		t.Fatal("expected non-nil preRun when WOL_MAC is set")
-	}
-
-	msg, err := preRun()
-	if err != nil {
-		t.Fatalf("preRun: %v", err)
-	}
-	if msg == "" {
-		t.Fatal("expected non-empty confirmation message")
-	}
-
-	buf := make([]byte, 200)
-	pc.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, _, err := pc.ReadFrom(buf)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if n != 102 {
-		t.Fatalf("received %d bytes, want 102", n)
-	}
-}
-
-func TestJobHandlerRunsWolPreRunBeforeScript(t *testing.T) {
-	dir := t.TempDir()
-	script := writeScript(t, dir, "startup.sh", "#!/bin/sh\necho hello\nexit 0\n")
-
-	state := &jobState{}
-	mux := http.NewServeMux()
-	preRun := func() (string, error) { return "WOL: sent magic packet to test", nil }
-	mux.HandleFunc("POST /hooks/startup", jobHandler(state, "startup", script, testToken, preRun))
-	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
-		if !authorized(r, testToken) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		writeJSON(w, state.snapshot())
-	})
-
-	rec := doRequest(t, mux, http.MethodPost, "/hooks/startup", testToken)
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want 202", rec.Code)
-	}
-
-	status := waitUntilIdle(t, mux)
-	output, _ := status["output_tail"].(string)
-	if !strings.Contains(output, "WOL: sent magic packet to test") {
-		t.Errorf("output_tail = %q, want it to contain the WOL pre-run message", output)
-	}
-	if !strings.Contains(output, "hello") {
-		t.Errorf("output_tail = %q, want it to also contain script output", output)
 	}
 }
