@@ -42,20 +42,31 @@ func (s *jobState) start(name string) bool {
 	return true
 }
 
-func (s *jobState) finish(exitCode int, output []byte, runErr error) {
+func (s *jobState) finish(exitCode int, runErr error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.running = false
 	s.finishedAt = time.Now()
 	s.exitCode = exitCode
-	if len(output) > maxOutputBytes {
-		output = output[len(output)-maxOutputBytes:]
-	}
-	s.output.Reset()
-	s.output.Write(output)
 	if runErr != nil {
 		s.lastErr = runErr.Error()
 	}
+}
+
+// Write implements io.Writer so a running job's combined stdout/stderr can
+// be wired directly into cmd.Stdout/cmd.Stderr and show up in /status
+// (output_tail) while the job is still in flight, not just after it exits.
+// Enforces maxOutputBytes as a rolling tail, same as before.
+func (s *jobState) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.output.Write(p)
+	if s.output.Len() > maxOutputBytes {
+		tail := append([]byte(nil), s.output.Bytes()[s.output.Len()-maxOutputBytes:]...)
+		s.output.Reset()
+		s.output.Write(tail)
+	}
+	return len(p), nil
 }
 
 func (s *jobState) snapshot() map[string]any {
@@ -159,9 +170,8 @@ func jobHandler(state *jobState, name, scriptPath, token string) http.HandlerFun
 
 func runJob(state *jobState, name, scriptPath string) {
 	cmd := exec.Command(scriptPath)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	cmd.Stdout = state
+	cmd.Stderr = state
 	err := cmd.Run()
 
 	exitCode := 0
@@ -172,7 +182,7 @@ func runJob(state *jobState, name, scriptPath string) {
 			exitCode = -1
 		}
 	}
-	state.finish(exitCode, out.Bytes(), err)
+	state.finish(exitCode, err)
 	log.Printf("job %q finished with exit code %d", name, exitCode)
 }
 

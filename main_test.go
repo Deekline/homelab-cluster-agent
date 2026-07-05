@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -178,6 +179,68 @@ func TestJobHandlerRejectsConcurrentRuns(t *testing.T) {
 	}
 
 	waitUntilIdle(t, mux)
+}
+
+func TestJobHandlerStreamsOutputWhileRunning(t *testing.T) {
+	dir := t.TempDir()
+	script := writeScript(t, dir, "slow.sh", "#!/bin/sh\necho first\nsleep 0.5\necho second\n")
+	mux, _ := newTestMux(script, "/nonexistent-shutdown.sh")
+
+	rec := doRequest(t, mux, http.MethodPost, "/hooks/startup", testToken)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", rec.Code)
+	}
+
+	// Poll until we observe "first" while the job is still running, proving
+	// output_tail updates live rather than only after the process exits.
+	deadline := time.Now().Add(2 * time.Second)
+	sawFirstWhileRunning := false
+	for time.Now().Before(deadline) {
+		statusRec := doRequest(t, mux, http.MethodGet, "/status", testToken)
+		var status map[string]any
+		if err := json.Unmarshal(statusRec.Body.Bytes(), &status); err != nil {
+			t.Fatalf("decode status: %v", err)
+		}
+		running, _ := status["running"].(bool)
+		tail, _ := status["output_tail"].(string)
+		if running && strings.Contains(tail, "first") {
+			sawFirstWhileRunning = true
+			break
+		}
+		if !running {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !sawFirstWhileRunning {
+		t.Fatal("expected /status to show partial output while the job was still running")
+	}
+
+	status := waitUntilIdle(t, mux)
+	if got := status["output_tail"]; got != "first\nsecond\n" {
+		t.Errorf("output_tail = %q, want %q", got, "first\nsecond\n")
+	}
+}
+
+func TestJobStateWriteTruncatesToRollingTail(t *testing.T) {
+	state := &jobState{}
+	state.start("test")
+
+	if _, err := state.Write([]byte(strings.Repeat("a", maxOutputBytes-5))); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if _, err := state.Write([]byte(strings.Repeat("b", 10))); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	got := state.snapshot()["output_tail"].(string)
+	if len(got) != maxOutputBytes {
+		t.Fatalf("len(output_tail) = %d, want %d", len(got), maxOutputBytes)
+	}
+	if !strings.HasSuffix(got, strings.Repeat("b", 10)) {
+		t.Fatalf("expected output_tail to end with the most recent writes")
+	}
 }
 
 func TestStatusRequiresToken(t *testing.T) {

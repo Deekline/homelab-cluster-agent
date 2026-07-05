@@ -5,6 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# kubectl (invoked by startup.sh's phase scripts) resolves its default
+# kubeconfig from $HOME/.kube/config. systemd doesn't set $HOME for this
+# unit on its own, so without this, kubectl silently fails to find any
+# config and wake-control-plane.sh's "wait for API server" loop retries
+# forever with no visible error (its kubectl call is `&>/dev/null`).
+Environment=HOME=/root
 EnvironmentFile=/etc/homelab-cluster-agent.env
 ExecStart=/usr/local/bin/homelab-cluster-agent
 Restart=on-failure

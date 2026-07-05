@@ -19,8 +19,10 @@ All endpoints except `/healthz` require the shared-secret header
 
 Only one job may run at a time; a second request while one is in flight
 gets `409 Conflict`. Job requests return `202 Accepted` immediately — poll
-`/status` for completion, exit code, and the last ~64KB of combined
-stdout/stderr.
+`/status` for progress and completion. `output_tail` (the last ~64KB of
+combined stdout/stderr) updates live as the script runs, not just after it
+exits, so a stuck job is visible mid-flight instead of showing an empty
+string until it finishes.
 
 The agent itself knows nothing about Wake-on-LAN, Proxmox, or the NAS — it
 just execs whatever `STARTUP_SCRIPT`/`SHUTDOWN_SCRIPT` point at and reports
